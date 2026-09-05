@@ -229,13 +229,163 @@ docker rmi auth-service:1.0   # remove the image
 Doing this one container at a time for all 4 services works, but you'd have
 to manually create a network and pass `--network` to every command so they
 can reach each other. **That's exactly what `docker compose` automates** —
-see Section 5.
+see Section 6. Section 5 below walks through doing it by hand first, since
+seeing the manual version is the fastest way to actually understand what
+Compose is doing for you.
 
 ---
 
-## 5. Deploying the application using Docker containers
+## 5. Running all 4 containers manually (no Compose yet)
 
-### 5.1 One-time server setup
+This section skips `docker-compose.yml` entirely and wires everything up
+with plain `docker run`, so the networking actually makes sense before a
+tool starts doing it for you.
+
+### Two things that trip up almost everyone new to this
+
+**1. `EXPOSE` in a Dockerfile does nothing by itself.** It's just
+documentation — a note to anyone reading the Dockerfile saying "this app
+listens on port 4000." It doesn't open any door. The thing that actually
+connects a port to the outside world is the `-p` flag on `docker run` (or
+`ports:` in Compose).
+
+**2. Containers can't find each other by name unless you put them on the
+same *custom* network.** If you just `docker run` with no `--network` flag,
+Docker puts the container on a default network called `bridge`, and on that
+default network, containers **cannot** resolve each other by name — there's
+no built-in DNS there. You'd have to hardcode fragile container IP
+addresses. The fix is to create your own network first — Docker gives
+*that* one automatic DNS, where each container's `--name` becomes a working
+hostname for the others on it.
+
+### Step 1 — create a network first
+
+```bash
+docker network create todo-net
+```
+This creates a private virtual switch on your machine. Nothing is running
+on it yet — you're just laying down the "table" that containers will sit at
+together.
+
+### Step 2 — start `auth-service`, attached to that network
+
+```bash
+cd services/auth-service
+docker build -t auth-service:1.0 .
+
+docker run -d \
+  --name auth-service \
+  --network todo-net \
+  --env-file .env \
+  auth-service:1.0
+```
+Notice: **no `-p` flag here.** We deliberately don't publish this one to
+the host — nothing outside Docker should ever reach `auth-service`
+directly. It's still fully reachable, just only *from other containers on
+`todo-net`*.
+
+### Step 3 — start `todo-service`, same network
+
+```bash
+cd services/todo-service
+docker build -t todo-service:1.0 .
+
+docker run -d \
+  --name todo-service \
+  --network todo-net \
+  --env-file .env \
+  todo-service:1.0
+```
+Same deal — no `-p`, internal only.
+
+### Step 4 — start `api-gateway`, published to the host, pointed at the other two by name
+
+```bash
+cd services/api-gateway
+docker build -t api-gateway:1.0 .
+
+docker run -d \
+  --name api-gateway \
+  --network todo-net \
+  -p 4000:4000 \
+  -e AUTH_SERVICE_URL=http://auth-service:4001 \
+  -e TODO_SERVICE_URL=http://todo-service:4002 \
+  --env-file .env \
+  api-gateway:1.0
+```
+This is the key moment: `http://auth-service:4001` — that hostname
+`auth-service` is *literally the `--name` you gave the other container*.
+Because all three are on `todo-net`, Docker's internal DNS resolves
+`auth-service` to whatever internal IP that container happens to have right
+now. You never need to know or hardcode that IP.
+
+`-p 4000:4000` means "take port 4000 on my actual machine, and forward it
+into this container's port 4000." That's the only one of these three
+getting a hole punched through to the outside world.
+
+### Step 5 — start `client`, published to the host too
+
+```bash
+cd client
+docker build -t client:1.0 --build-arg VITE_API_BASE_URL=http://<server-ip>:4000 .
+
+docker run -d \
+  --name client \
+  --network todo-net \
+  -p 3000:80 \
+  client:1.0
+```
+The client doesn't actually *need* to be on `todo-net` for anything to
+work — it doesn't talk to the other containers directly. The browser does,
+over the internet/host network, using the URL baked into the JS at build
+time. Being on `todo-net` here is harmless but not load-bearing.
+
+### The rules this whole exercise is teaching you
+
+**Reaching a container from your laptop/browser:** you must go through a
+`-p host:container` mapping. Only `client` (3000→80) and `api-gateway`
+(4000→4000) have one, so only those two are reachable from outside.
+`auth-service` and `todo-service` have no `-p` at all — there is no path in
+from outside, period, not even from `localhost` on the host machine.
+
+**One container reaching another:** the `-p` mappings are irrelevant here —
+that's a host-facing concept. What matters is `--network todo-net` and
+using the target's **container name** as the hostname, on its **container
+port** (not any host port). That's why `api-gateway` calls
+`http://auth-service:4001`, never `http://localhost:4001` — `localhost`
+inside `api-gateway`'s container means *itself*, not the auth-service
+container.
+
+### Try this once it's running, to make it click
+
+```bash
+docker network inspect todo-net          # see all 4 containers listed with their internal IPs
+
+docker exec -it api-gateway sh
+# then, inside that shell:
+ping auth-service                        # resolves via Docker's DNS
+curl http://auth-service:4001/health     # reaches it, over todo-net
+curl http://localhost:4001/health        # fails - nothing listens on api-gateway's OWN port 4001
+```
+
+### Cleaning up the manual setup
+
+```bash
+docker stop client api-gateway todo-service auth-service
+docker rm client api-gateway todo-service auth-service
+docker network rm todo-net
+```
+
+Once this clicks, `docker-compose.yml` will make a lot more sense — it's
+really just automating exactly these `docker network create` +
+`docker run --network ... --name ...` steps for you, one block per service,
+which is what the rest of this README uses from here on.
+
+---
+
+## 6. Deploying the application using Docker containers
+
+### 6.1 One-time server setup
 On a fresh Ubuntu server (EC2 or otherwise) — this replaces *all* of the old
 "install Node, PM2, git, npm install" steps:
 ```bash
@@ -248,19 +398,30 @@ docker compose version
 ```
 
 Security group / firewall — same rule as the manual setup, Docker doesn't
-change the networking story at the host level:
+change the networking story at the host level. **If you're fronting the
+frontend with your own host-level Nginx + a domain** (see 6.8 below — this
+is the current setup for `todo.crashloop.in`), the rule changes slightly:
 - Open **22** (SSH) — your IP only
-- Open **3000** (frontend) — public
-- Open **4000** (api-gateway) — public
+- Open **80** (and later 443, once you add TLS) — public. This is your
+  host Nginx, which reverse-proxies to the `client` container on `3000`.
+- Open **4000** (api-gateway) — still public, still exposed **directly**
+  (not through Nginx or the domain) — the client's JS calls it straight on
+  its own port
+- **Close 3000 to the outside world** — since Nginx now sits in front of
+  it, the only thing that needs to reach port 3000 is Nginx itself, running
+  on `localhost` on the same machine. See the Docker Compose change in 6.8.
 - **Do NOT open 4001/4002** — they're not even published to the host in `docker-compose.yml`, so this is enforced by the compose file itself, not just the firewall
 
-### 5.2 Get the code onto the server
+*(If you're not using a domain/reverse proxy at all, the original rule
+still applies: open 3000 and 4000 directly, skip 80/443.)*
+
+### 6.2 Get the code onto the server
 ```bash
 git clone <your-repo-url> mern-todo-docker
 cd mern-todo-docker
 ```
 
-### 5.3 Configure environment files
+### 6.3 Configure environment files
 Same `.env` files as the manual setup, one per service — Docker doesn't
 change what goes in them, only that they're passed via `env_file:` in
 compose instead of being read directly off disk by a PM2 process.
@@ -272,10 +433,15 @@ cp .env.example .env   # sets VITE_API_BASE_URL for the client's build
 
 nano services/auth-service/.env   # paste Neon DATABASE_URL + a strong JWT_SECRET
 nano services/todo-service/.env   # SAME DATABASE_URL/JWT_SECRET as auth-service
-nano .env                         # VITE_API_BASE_URL=http://<server-public-ip>:4000
+nano .env                         # VITE_API_BASE_URL=http://todo.crashloop.in:4000
 ```
+Note it's `todo.crashloop.in:4000`, not just `todo.crashloop.in` — the
+gateway is being kept on its own port rather than proxied through the
+domain (see 6.8), so the client's compiled JS needs the `:4000` to reach
+it. DNS already resolves `todo.crashloop.in` to your server, so this works
+identically to using the raw IP, just with a stable hostname instead.
 
-### 5.4 Build and start everything
+### 6.4 Build and start everything
 ```bash
 docker compose -f docker-compose.yml up -d --build
 ```
@@ -287,7 +453,7 @@ Compose reads `docker-compose.yml`, and for each service: builds its image
 (if not already built), creates `todo-net` if it doesn't exist, starts each
 container attached to that network, and applies the `ports:` mappings.
 
-### 5.5 Verify
+### 6.5 Verify
 ```bash
 docker compose ps                       # see all 4 containers and their status/health
 docker compose logs -f                  # tail logs from all services
@@ -296,9 +462,10 @@ docker compose logs -f auth-service     # logs from just one
 curl http://localhost:4000/health       # api-gateway, from the host
 docker compose exec api-gateway wget -qO- http://auth-service:4001/health   # prove internal DNS works
 ```
-Then visit `http://<server-public-ip>:3000` in a browser.
+Then visit `http://todo.crashloop.in` in a browser (port 80, via your host
+Nginx — see 6.8 below for what that config does and one thing to check).
 
-### 5.6 Redeploying after a code change
+### 6.6 Redeploying after a code change
 ```bash
 git pull
 docker compose up -d --build   # only rebuilds images whose Dockerfile/context actually changed
@@ -307,16 +474,78 @@ This is the single biggest operational win over the manual approach — one
 command instead of re-running `npm install`, rebuilding the client, and
 `pm2 restart`ing the right processes in the right order.
 
-### 5.7 Common lifecycle commands
+### 6.7 Common lifecycle commands
 ```bash
 docker compose stop                 # stop containers, keep them (and the network) around
 docker compose start                # start them again
 docker compose restart auth-service # restart just one
 docker compose down                 # stop AND remove containers + the network (images/volumes untouched)
-docker compose down -v              # also remove any named volumes (careful — see Section 7)
+docker compose down -v              # also remove any named volumes (careful — see Section 8)
 ```
 
-### 5.8 (Optional, recommended) Docker also survives reboots
+### 6.8 Domain + host-level Nginx in front of the client (your current setup)
+
+If you already have Nginx installed **directly on the server** (not in a
+container) configured to route `todo.crashloop.in` on port 80 to `3000`,
+here's exactly how that fits with everything above:
+
+```
+Browser → todo.crashloop.in:80 → host Nginx → localhost:3000 → [client container] nginx:80
+Browser → todo.crashloop.in:4000 (or the raw server IP:4000) → [api-gateway container] :4000  (unchanged, not touched by host Nginx)
+```
+
+A config like yours typically looks like this:
+```nginx
+server {
+    listen 80;
+    server_name todo.crashloop.in;
+
+    location / {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+}
+```
+That's fine as-is and needs **no changes on the Nginx side** since you're
+keeping the gateway on its own port rather than proxying `/api` through the
+domain. Two things worth doing on the **Docker side** to match it, though:
+
+1. **Stop publishing port 3000 to the whole internet.** Right now
+   `docker-compose.yml` has `"3000:80"`, which binds to `0.0.0.0` — meaning
+   anyone could still hit `http://<server-ip>:3000` directly, bypassing
+   Nginx and your domain entirely. Since only your host Nginx needs to
+   reach that port now, bind it to localhost only:
+   ```yaml
+   client:
+     ports:
+       - "127.0.0.1:3000:80"   # was: "3000:80"
+   ```
+   Nginx running on the same host can still reach `127.0.0.1:3000` just
+   fine; nothing external can anymore. This repo's `docker-compose.yml`
+   already has this applied.
+
+2. **Watch for mixed-content issues once you add HTTPS.** The moment you
+   put a TLS certificate on `todo.crashloop.in` (e.g. via Certbot) so the
+   site loads over `https://`, the browser will refuse to let that HTTPS
+   page call the gateway over plain `http://todo.crashloop.in:4000` — this
+   is what browsers call "mixed content" and they block it silently. At
+   that point you have two options:
+   - Also proxy `/api` through the same Nginx + domain (so the client
+     calls `https://todo.crashloop.in/api/...` and Nginx forwards to
+     `localhost:4000` internally) and rebuild the client with
+     `VITE_API_BASE_URL=https://todo.crashloop.in`, or
+   - Put a **separate** cert on the gateway port (a second `server { listen
+     4000 ssl; ... }` Nginx block, or a small reverse-proxy container
+     dedicated to the gateway).
+
+   Either is a small follow-up, not something you need to solve before
+   your first deploy over plain HTTP.
+
+### 6.9 (Optional, recommended) Docker also survives reboots
 ```bash
 # Compose already sets restart: unless-stopped on every service, so as long
 # as the Docker daemon itself starts on boot (it does, by default, once
@@ -327,10 +556,10 @@ sudo systemctl enable docker
 
 ---
 
-## 6. How a request flows *inside* the containers
+## 7. How a request flows *inside* the containers
 
 Zooming into just the container layer (compare with the full diagram in
-Section 2):
+Section 2, and the manual step-by-step version in Section 5):
 
 ```
 Browser
@@ -374,7 +603,7 @@ server, but *identical in effect*:
 
 ---
 
-## 7. Docker volumes and networks
+## 8. Docker volumes and networks
 
 ### Networks
 A Docker network is a private virtual network that containers attach to.
@@ -385,7 +614,7 @@ networks:
     driver: bridge
 ```
 - **`bridge`** is the default driver for a single-host setup like this one — it creates an isolated virtual switch that containers plug into.
-- Containers on the same network reach each other **by service name** via Docker's built-in DNS (see Sections 2 and 6) — no hardcoded IPs, and the IPs can change across restarts without breaking anything.
+- Containers on the same network reach each other **by service name** via Docker's built-in DNS (see Sections 2, 5, and 7) — no hardcoded IPs, and the IPs can change across restarts without breaking anything.
 - Containers **not** on the same network can't reach each other at all by default — this is what makes "don't expose 4001/4002 publicly" enforceable at the Docker level, not just a firewall convention.
 - You can inspect it: `docker network inspect mern-todo_todo-net`
 
