@@ -1,0 +1,41 @@
+# OPTIONAL / EDUCATIONAL FILE - not used by default.
+#
+# The app in this repo talks to Neon (managed, external Postgres), so there's
+# normally no database container and no need for a named volume. This file
+# is here purely so you can SEE a real named volume in action, in case you
+# ever want to run Postgres locally instead of using Neon.
+#
+# Usage (only if you want local Postgres instead of Neon):
+#   docker compose -f docker-compose.yml -f docker-compose.local-postgres.example.yml up -d --build
+# Then point DATABASE_URL in the two service .env files at:
+#   postgres://todo:todo@postgres:5432/tododb
+# (and remove the `?sslmode=require` bit and the ssl option in db.js, since
+# local Postgres doesn't use TLS by default).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: local-postgres
+    environment:
+      POSTGRES_USER: todo
+      POSTGRES_PASSWORD: todo
+      POSTGRES_DB: tododb
+    volumes:
+      # NAMED VOLUME: Docker manages the storage location on the host for
+      # you. Unlike the container's filesystem, this survives
+      # `docker compose down`, image rebuilds, and container recreation -
+      # only `docker compose down -v` or `docker volume rm` deletes it.
+      # This is what makes a database container's data durable.
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, only on first container creation with an empty data dir,
+      # to auto-create the tables from this repo's schema.sql files.
+      - ./services/auth-service/sql/schema.sql:/docker-entrypoint-initdb.d/01-auth.sql
+      - ./services/todo-service/sql/schema.sql:/docker-entrypoint-initdb.d/02-todo.sql
+    ports:
+      - "5432:5432"   # optional: only needed if you want to connect from your host with psql/a GUI
+    networks:
+      - todo-net
+    restart: unless-stopped
+
+volumes:
+  pgdata:

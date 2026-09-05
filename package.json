@@ -1,0 +1,15 @@
+{
+  "name": "mern-todo-monorepo",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "services/*",
+    "client"
+  ],
+  "scripts": {
+    "start:auth": "npm run start --workspace=auth-service",
+    "start:todo": "npm run start --workspace=todo-service",
+    "start:gateway": "npm run start --workspace=api-gateway",
+    "build:client": "npm run build --workspace=client"
+  }
+}

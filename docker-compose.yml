@@ -1,0 +1,85 @@
+name: mern-todo
+
+# ---------------------------------------------------------------------------
+# One shared custom network for all backend containers. Compose actually
+# creates a default network for you automatically even without this block,
+# but declaring it explicitly makes the concept visible and lets us name it.
+# Containers on the same Docker network can reach each other BY SERVICE NAME
+# (Docker's built-in DNS) - e.g. from inside api-gateway, "http://auth-service:4001"
+# resolves correctly. This replaces "localhost:4001" from the old PM2 setup.
+# ---------------------------------------------------------------------------
+networks:
+  todo-net:
+    driver: bridge
+
+services:
+  auth-service:
+    build:
+      context: ./services/auth-service
+    container_name: auth-service
+    env_file:
+      - ./services/auth-service/.env
+    networks:
+      - todo-net
+    # NOT published to the host on purpose (mirrors the EC2 security-group
+    # rule in the manual README: 4001 must never be reachable from outside).
+    # It's still reachable by other containers on todo-net, just not by
+    # the host machine or the internet.
+    restart: unless-stopped
+
+  todo-service:
+    build:
+      context: ./services/todo-service
+    container_name: todo-service
+    env_file:
+      - ./services/todo-service/.env
+    networks:
+      - todo-net
+    restart: unless-stopped
+    depends_on:
+      - auth-service
+
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+    container_name: api-gateway
+    env_file:
+      - ./services/api-gateway/.env
+    environment:
+      # Overrides the .env defaults so the gateway uses Docker's internal
+      # DNS names instead of "localhost" (each service now runs in its
+      # own container, so localhost no longer means "the other service").
+      AUTH_SERVICE_URL: http://auth-service:4001
+      TODO_SERVICE_URL: http://todo-service:4002
+    ports:
+      - "4000:4000"     # published: this is the one public backend port
+    networks:
+      - todo-net
+    restart: unless-stopped
+    depends_on:
+      - auth-service
+      - todo-service
+
+  client:
+    build:
+      context: ./client
+      args:
+        # Baked into the JS bundle at build time - point this at wherever
+        # api-gateway is publicly reachable (EC2 public IP/domain + :4000).
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:4000}
+    container_name: client
+    ports:
+      - "3000:80"       # host:3000 -> container's nginx on port 80
+    networks:
+      - todo-net
+    restart: unless-stopped
+    depends_on:
+      - api-gateway
+
+# ---------------------------------------------------------------------------
+# No named volumes are declared here because this app's actual data lives in
+# Neon Postgres, which is an external managed database - not a container -
+# so there's nothing stateful to persist locally. See README section 7 for
+# how volumes work and a runnable example if you swap Neon for a local
+# Postgres container.
+# ---------------------------------------------------------------------------

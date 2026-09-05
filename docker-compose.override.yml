@@ -1,0 +1,39 @@
+# This file is loaded AUTOMATICALLY by `docker compose up` whenever it sits
+# next to docker-compose.yml - Compose merges the two. It exists purely to
+# demonstrate BIND MOUNTS for local development with hot-reload, so you can
+# see your code changes without rebuilding the image every time.
+#
+# For a real server deployment, delete or ignore this file and just use
+# `docker compose -f docker-compose.yml up -d` (see README section 5).
+
+services:
+  auth-service:
+    command: node --watch src/index.js
+    volumes:
+      # Bind mount: maps your LOCAL folder straight into the container, so
+      # edits on your machine are instantly visible inside the container.
+      - ./services/auth-service/src:/app/src
+      # Anonymous volume "shadowing" trick: without this line, the bind
+      # mount above would completely replace the container's /app folder,
+      # including the node_modules that were installed during the image
+      # build - deleting them from the container's point of view. This
+      # empty volume keeps /app/node_modules coming from the IMAGE, not
+      # from your (probably empty, or OS-mismatched) local folder.
+      - /app/node_modules
+
+  todo-service:
+    command: node --watch src/index.js
+    volumes:
+      - ./services/todo-service/src:/app/src
+      - /app/node_modules
+
+  api-gateway:
+    command: node --watch src/index.js
+    volumes:
+      - ./services/api-gateway/src:/app/src
+      - /app/node_modules
+
+  # The client isn't included here because it's served by Vite's own dev
+  # server (npm run dev) when you're actively working on the frontend -
+  # run that on your host machine directly, and only build/containerize
+  # the client with Docker when you're ready to deploy (see README 5).
