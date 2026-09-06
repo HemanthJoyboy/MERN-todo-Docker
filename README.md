@@ -663,14 +663,3 @@ docker volume inspect pgdata     # see where Docker actually stores it on disk
 ```
 
 ---
-
-## Suggested repo name
-
-`mern-todo-docker` (used above) — short, matches the existing
-`mern-todo-monorepo` naming, and immediately tells you what's different
-about this copy.
-
-Other reasonable options if you want something more course/portfolio-flavored:
-- `learning-docker-mern-todo` — reads as a learning project first, todo app second
-- `deploying-mern-with-docker` — leans into the deployment angle
-- `mern-todo-containerized`
